@@ -1,8 +1,9 @@
 model:
   arch: YOLOLiteMS_CPU
-  backbone: litedet_n
+  backbone: litedet_xs
   depth_multiple: 0.65
   width_multiple: 0.60
   fpn_channels: 160
 
   head_depth: 1
+
