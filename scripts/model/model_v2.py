@@ -51,6 +51,90 @@ def make_head(A, head_depth, C, fpn_channels):
         "cls": nn.Conv2d(fpn_channels, A * C, 1)
     })
     return nn.ModuleDict({"trunk": trunk, "out": out_layers})
+class ConvBNAct(nn.Module):
+    def __init__(self, c_in, c_out, k=1, s=1, p=None, groups=1, act="silu"):
+        super().__init__()
+        if p is None:
+            p = (k - 1) // 2
+        self.conv = nn.Conv2d(c_in, c_out, k, s, p, groups=groups, bias=False)
+        self.bn = nn.BatchNorm2d(c_out)
+        if act == "relu":
+            self.act = nn.ReLU(inplace=True)
+        elif act == "silu":
+            self.act = nn.SiLU(inplace=True)
+        else:
+            raise ValueError(f"Unknown act={act}")
+
+    def forward(self, x):
+        return self.act(self.bn(self.conv(x)))
+
+
+class Downsample(nn.Module):
+    """3x3 stride-2 downsample, valbart DW-separable."""
+    def __init__(self, c, dw=False, act="silu"):
+        super().__init__()
+        if not dw:
+            self.m = ConvBNAct(c, c, k=3, s=2, act=act)
+        else:
+            # depthwise s=2 + pointwise
+            self.m = nn.Sequential(
+                ConvBNAct(c, c, k=3, s=2, groups=c, act=act),
+                ConvBNAct(c, c, k=1, s=1, act=act),
+            )
+
+    def forward(self, x):
+        return self.m(x)
+
+
+class C2fLite(nn.Module):
+    """
+    YOLOv8-lik 'C2f' idé (split + kedja + concat), men förenklad.
+    Tar in 2*C och returnerar C.
+    """
+    def __init__(self, c_in, c_out, n=1, dw=False, act="silu"):
+        super().__init__()
+        # Projekt till 2*hidden för att splitta
+        hidden = max(8, c_out // 2)
+        self.cv1 = ConvBNAct(c_in, 2 * hidden, k=1, act=act)
+
+        blocks = []
+        for _ in range(n):
+            if not dw:
+                blocks.append(ConvBNAct(hidden, hidden, k=3, act=act))
+            else:
+                blocks.append(nn.Sequential(
+                    ConvBNAct(hidden, hidden, k=3, groups=hidden, act=act),
+                    ConvBNAct(hidden, hidden, k=1, act=act),
+                ))
+        self.m = nn.Sequential(*blocks)
+
+        # (y1, y2, y2_1, ..., y2_n) -> c_out
+        self.cv2 = ConvBNAct((2 + n) * hidden, c_out, k=1, act=act)
+
+    def forward(self, x):
+        y = self.cv1(x)
+        y1, y2 = y.chunk(2, dim=1)
+        outs = [y1, y2]
+        for blk in self.m:
+            y2 = blk(y2)
+            outs.append(y2)
+        return self.cv2(torch.cat(outs, dim=1))
+
+
+class WeightedAdd(nn.Module):
+    """BiFPN-style viktad summa (ReLU-normaliserad)."""
+    def __init__(self, n_inputs: int, eps: float = 1e-4):
+        super().__init__()
+        self.w = nn.Parameter(torch.ones(n_inputs, dtype=torch.float32))
+        self.eps = eps
+
+    def forward(self, *xs):
+        w = F.relu(self.w)
+        w = w / (w.sum() + self.eps)
+        out = 0.0
+        for i, x in enumerate(xs):
+            out = out + w[i] * x
+        return out
 
 
 
@@ -397,4 +481,5 @@ class YOLOLiteMS_CPU(nn.Module):
                 Ss.append(Ss[-1] // 2)
             strides = [img_size // S for S in Ss]
             print(f"[YOLOLiteMS_CPU] grids={Ss} → strides={strides}")
+
 
