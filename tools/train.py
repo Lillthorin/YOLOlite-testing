@@ -148,7 +148,8 @@ if __name__ == "__main__":
             head_depth=config["model"].get("head_depth", 1),
             num_anchors_per_level=num_anchors_per_level,   # t.ex. (3,3,3)
             use_p6=config["training"]["use_p6"],
-            use_p2=config["training"]["use_p2"]
+            use_p2=config["training"]["use_p2"],
+            neck_variant = config["training"]["neck_variant"]
             
         ).to(DEVICE)
     elif config["model"]["arch"].lower() == 'yololitems_cpu':
@@ -161,7 +162,8 @@ if __name__ == "__main__":
             width_multiple=config["model"].get("width_multiple", 1.0),
             head_depth=config["model"].get("head_depth", 1),
             use_p6=config["training"]["use_p6"],
-            use_p2 = config["training"]["use_p2"]
+            use_p2 = config["training"]["use_p2"],
+            neck_variant = config["training"]["neck_variant"]
             
         ).to(DEVICE)
 
@@ -555,6 +557,7 @@ if __name__ == "__main__":
 
     
     
+
 
 
 
