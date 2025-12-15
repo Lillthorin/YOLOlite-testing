@@ -3,7 +3,7 @@ logging:
 
 loss:
   lambda_box: 5.0
-  lambda_obj: 1.5
+  lambda_obj: 0.75
   lambda_cls: 1.0
   focal_loss: false           
   center_radius: 2.5
@@ -15,7 +15,7 @@ loss:
   alpha:  0.25
   cls_smoothing:  0.05
   area_cells_min:  0.0
-  area_cells_max: 512
+  area_cells_max: 256
   area_tol:  1.25
   size_prior_w: 0.2
   ar_prior_w:  0.1
@@ -53,6 +53,7 @@ training:
   save_by: 
   pretrained: true
   
+
 
 
 
