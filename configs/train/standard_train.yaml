@@ -14,7 +14,7 @@ loss:
   gamma:  2
   alpha:  0.25
   cls_smoothing:  0.05
-  area_cells_min:  0.5
+  area_cells_min:  0.0
   area_cells_max: 512
   area_tol:  1.25
   size_prior_w: 0.2
@@ -53,6 +53,7 @@ training:
   save_by: 
   pretrained: true
   
+
 
 
 
