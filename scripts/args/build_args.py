@@ -260,9 +260,12 @@ def build_argparser() -> argparse.ArgumentParser:
     ap.add_argument("--save_every", type=int, default=25, help="Save every x epoch")
     ap.add_argument("--save_by", type=str, default='AP', help="Save best model by coco evaluation, viable setting [AP50, AP75, AP, AR, APS, APM, APL]")  
     ap.add_argument("--anchors_per_level", type=int, default=1,help="Num anchors per level")  
+    ap.add_argument("--neck", type=str, default="bifpn_lite", help="fpn_add", "pan_concat", "bifpn_lite")
     return ap
 
 def apply_overrides(config: Dict[str, Any], args: argparse.Namespace) -> Dict[str, Any]:
+    if args.neck is not None:
+        config["training"]["neck_variant"]=str(args.neck)
     # CLI ska få sista ordet
     ok_save_by = ["AP50", "AP75", "AP", "AR", "APS", "APM", "APL"]
     if args.epochs is not None:
@@ -300,5 +303,6 @@ def apply_overrides(config: Dict[str, Any], args: argparse.Namespace) -> Dict[st
     if args.anchors_per_level is not None:
         config["model"]["num_anchors_per_level"] = int(args.anchors_per_level)
     return config
+
 
 
