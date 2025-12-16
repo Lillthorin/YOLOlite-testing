@@ -1,10 +1,11 @@
 model:
   arch: YOLOLiteMS_CPU
   backbone: cs3darknet_focus_s
-  depth_multiple: 0.95
-  width_multiple: 0.85
-  fpn_channels: 288
-  head_depth: 2
+  depth_multiple: 1.0
+  width_multiple: 1.0
+  fpn_channels: 196
+  head_depth: 1
+
 
 
 
