@@ -12,10 +12,10 @@ loss:
 
   center_radius: 3.5
   center_radius_cells: 3.5
-  topk_limit: 80
+  topk_limit: 40
 
   area_cells_min: 0.0
-  area_cells_max: 512
+  area_cells_max: 256
   area_tol: 1.75
 
   iou_cost_w: 2.0
@@ -54,6 +54,7 @@ training:
   save_by: 
   pretrained: true
   
+
 
 
 
