@@ -10,9 +10,9 @@ loss:
   size_prior_w: 0.0
   ar_prior_w: 0.0
 
-  center_radius: 3.5
+  center_radius: 3.0
   center_radius_cells: 3.5
-  topk_limit: 40
+  topk_limit: 20
 
   area_cells_min: 0.0
   area_cells_max: 256
@@ -54,6 +54,7 @@ training:
   save_by: 
   pretrained: true
   
+
 
 
 
