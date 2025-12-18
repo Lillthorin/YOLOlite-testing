@@ -132,8 +132,24 @@ if __name__ == "__main__":
             drop_last=False,
         )
     
+    if config["dataset"]["test_images"]:
+        test_ds = YoloDataset(
+            config["dataset"]["test_images"],
+            config["dataset"]["test_labels"],
+            img_size=IMG_SIZE,
+            is_train=False,
+            transforms=get_val_transform(IMG_SIZE, val_resize)
+        )
+        test_loader = DataLoader(
+                test_ds,
+                batch_size=config["training"]["batch_size"],
+                shuffle=False,
+                num_workers=0,
+                pin_memory=True,
+                collate_fn=yolo_collate,         # <-- INTE lambda
+                drop_last=False,
+            )
     
-
     batch_size = config["training"]["batch_size"]
     num = config["model"]["num_anchors_per_level"]
     num_anchors_per_level = _build_num_anchors(config["training"]["use_p6"], config["training"]["use_p2"], num)
@@ -552,11 +568,12 @@ if __name__ == "__main__":
         ckpt = torch.load(best_no_aug, map_location=DEVICE) 
     missing, unexpected = model.load_state_dict(ckpt["state_dict"], strict=False)
     model.eval()
-    evaluate_model(model=model, val_loader=val_loader, log_dir=log_dir, NUM_CLASSES=NUM_CLASSES, DEVICE=DEVICE, IMG_SIZE=IMG_SIZE, batch_size=batch_size, class_names=class_names)
+    evaluate_model(model=model, val_loader=test_loader, log_dir=log_dir, NUM_CLASSES=NUM_CLASSES, DEVICE=DEVICE, IMG_SIZE=IMG_SIZE, batch_size=batch_size, class_names=class_names)
 
 
     
     
+
 
 
 
