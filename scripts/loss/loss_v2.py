@@ -117,7 +117,7 @@ def bbox_iou(box1: torch.Tensor, box2: torch.Tensor, eps: float = 1e-7) -> torch
 
 # --------------------------- End-to-End Loss ---------------------------
 
-class LossEnd2End(nn.Module):
+class LossAF(nn.Module):
     """
     NMS-fri loss (End-to-End).
     1. Tar emot lista med features från modellen.
