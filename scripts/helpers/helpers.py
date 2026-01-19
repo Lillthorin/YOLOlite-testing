@@ -51,187 +51,104 @@ def _xyxy_to_xywh(xyxy: torch.Tensor) -> torch.Tensor:
     return torch.stack([cx, cy, w, h], dim=-1)
 
 # =============== Decoding & Evaluering ===============
+
 @torch.no_grad()
-def save_val_debug_anchorfree(imgs, preds, epoch, out_dir,
-                              img_size=640, conf_th=0.25, iou_th=0.45,
-                              mean=(0.485,0.456,0.406), std=(0.229,0.224,0.225),
-                              center_mode="v8", wh_mode="softplus"):
+def _decode_batch_to_coco_dets(preds, img_size, conf_th=0.25, iou_th=0.45, add_one=True, center_mode="v8", wh_mode="softplus"):
     """
-    [FIXAD] Debug-funktion för End-to-End modellen.
-    Hanterar platt output [Batch, TotalAnchors, 4+C] där koordinaterna redan är pixlar.
+    [ÄNDRAD] End-to-End version.
+    preds: List[Tensor] där varje Tensor är [B, A, S, S, 4+C] (inget obj!)
+    eller en enda concatad tensor [B, Total, 4+C].
     """
-    import os, cv2, torch, numpy as np
-    from torchvision.ops import nms
-
-    os.makedirs(out_dir, exist_ok=True)
-    device = imgs.device
-    
-    # 1. Hantera input-format
-    # Modellen returnerar [B, N, 4+C] vid validering.
-    # Om det är en lista (från träning ibland), ta första elementet (Main output).
+    # Hantera om input kommer som lista av nivåer eller platt tensor
     if isinstance(preds, (list, tuple)):
-        p = preds[0]
+        # Platta ut allt först om det är uppdelat
+        all_preds = []
+        for p in preds:
+            # p: [B, A, S, S, 4+C] -> [B, N, 4+C]
+            B, A, S, _, D = p.shape
+            stride = img_size / S
+            
+            # Decode coords direkt här för enkelhetens skull
+            tx, ty, tw, th = p[..., 0], p[..., 1], p[..., 2], p[..., 3]
+            tcls = p[..., 4:] # Nu index 4 framåt är klasser!
+            
+            # Grid
+            gy, gx = torch.meshgrid(torch.arange(S, device=p.device), torch.arange(S, device=p.device), indexing="ij")
+            
+            if center_mode == "v8":
+                px = ((torch.sigmoid(tx) * 2 - 0.5) + gx) * stride
+                py = ((torch.sigmoid(ty) * 2 - 0.5) + gy) * stride
+            else:
+                px = (torch.sigmoid(tx) + gx) * stride
+                py = (torch.sigmoid(ty) + gy) * stride
+                
+            if wh_mode == "softplus":
+                pw = F.softplus(tw) * stride
+                ph = F.softplus(th) * stride
+            elif wh_mode == "v8":
+                pw = (torch.sigmoid(tw) * 2).pow(2) * stride
+                ph = (torch.sigmoid(th) * 2).pow(2) * stride
+            else:
+                pw = torch.exp(tw.clamp(-10, 8)) * stride
+                ph = torch.exp(th.clamp(-10, 8)) * stride
+                
+            # xywh -> xyxy
+            x1 = px - pw * 0.5
+            y1 = py - ph * 0.5
+            x2 = px + pw * 0.5
+            y2 = py + ph * 0.5
+            
+            # [B, N, 4] och [B, N, C]
+            boxes = torch.stack([x1, y1, x2, y2], dim=-1).view(B, -1, 4)
+            logits = tcls.view(B, -1, tcls.shape[-1])
+            all_preds.append(torch.cat([boxes, logits], dim=-1))
+            
+        preds_flat = torch.cat(all_preds, dim=1) # [B, Total, 4+C]
     else:
-        p = preds
+        # Antag redan avkodad och platt (om du ändrar din modell att göra det internt)
+        preds_flat = preds
 
-    # Kontrollera att vi har rätt form: [B, N, D]
-    if p.dim() != 3:
-        print(f"Varning: save_val_debug fick fel dimensioner {p.shape}, hoppar över.")
-        return
-
-    B, N, D = p.shape
-    
-    # Eftersom modellen redan avkodar till pixlar (xywh), behöver vi bara konvertera till xyxy
-    # p[..., :4] är [cx, cy, w, h] i pixlar
-    cx = p[..., 0]
-    cy = p[..., 1]
-    w  = p[..., 2]
-    h  = p[..., 3]
-    tcls = p[..., 4:]
-
-    # xywh -> xyxy
-    x1 = cx - 0.5 * w
-    y1 = cy - 0.5 * h
-    x2 = cx + 0.5 * w
-    y2 = cy + 0.5 * h
-    
-    # [B, N, 4]
-    boxes_xyxy = torch.stack([x1, y1, x2, y2], dim=-1)
-
-    # Helper för att denormalisera bild
-    def _denorm(img_t):
-        img = img_t.detach().float().cpu()
-        for t, m, s in zip(img, mean, std):
-            t.mul_(s).add_(m)
-        np_img = (img.permute(1,2,0).numpy() * 255.0).clip(0,255).astype("uint8")
-        return cv2.cvtColor(np.ascontiguousarray(np_img), cv2.COLOR_RGB2BGR)
-
-    # 2. Loopa över batch och rita
-    for b in range(min(B, 4)): # Spara max 4 bilder
-        img_np = _denorm(imgs[b])
-        
-        # Hämta data för denna bild
-        b_boxes = boxes_xyxy[b]      # [N, 4]
-        b_logits = tcls[b]           # [N, C]
-        
-        # Hitta bästa klass och score
-        scores = b_logits.sigmoid()
-        max_scores, class_ids = scores.max(dim=-1) # [N]
-        
-        # Filtrera på confidence (viktigt för att slippa rita 8400 boxar)
-        mask = max_scores > conf_th
-        
-        if not mask.any():
-            # Inga objekt hittades, spara tom bild
-            cv2.imwrite(os.path.join(out_dir, f"epoch_{epoch}_b{b}_empty.jpg"), img_np)
-            continue
-            
-        sel_boxes = b_boxes[mask]
-        sel_scores = max_scores[mask]
-        sel_classes = class_ids[mask]
-        
-        # (Valfritt) Säkerhets-NMS för renare visualisering
-        # Även om modellen är NMS-fri kan den ge dubbletter i början av träningen
-        if iou_th < 1.0:
-            keep = nms(sel_boxes, sel_scores, iou_th)
-            sel_boxes = sel_boxes[keep]
-            sel_scores = sel_scores[keep]
-            sel_classes = sel_classes[keep]
-        
-        # Begränsa antalet ritade boxar så bilden inte blir klottrig
-        if sel_scores.numel() > 50:
-            topk = sel_scores.topk(50).indices
-            sel_boxes = sel_boxes[topk]
-            sel_scores = sel_scores[topk]
-            sel_classes = sel_classes[topk]
-
-        # Rita
-        for box, score, cid in zip(sel_boxes, sel_scores, sel_classes):
-            _x1, _y1, _x2, _y2 = [int(v) for v in box.tolist()]
-            
-            # Clip innanför bild
-            _x1 = max(0, min(img_size, _x1))
-            _y1 = max(0, min(img_size, _y1))
-            _x2 = max(0, min(img_size, _x2))
-            _y2 = max(0, min(img_size, _y2))
-
-            label = f"{int(cid)}: {score:.2f}"
-            color = (0, 255, 0) # Grön
-            
-            cv2.rectangle(img_np, (_x1, _y1), (_x2, _y2), color, 2)
-            cv2.putText(img_np, label, (_x1, max(10, _y1-5)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
-            
-        cv2.imwrite(os.path.join(out_dir, f"epoch_{epoch}_b{b}.jpg"), img_np)
-@torch.no_grad()
-def _decode_batch_to_coco_dets(preds, img_size, conf_th=0.001, iou_th=0.65, add_one=True, center_mode="v8", wh_mode="softplus"):
-    """
-    [FIXAD] End-to-End version för COCO eval.
-    Hanterar att modellen nu returnerar [Batch, TotalAnchors, 4+C] i pixlar.
-    """
-    
-    # 1. Standardisera input (Validering ger tensor, Träning ger tuple/list)
-    if isinstance(preds, (list, tuple)):
-        p = preds[0] # Ta Main output
-    else:
-        p = preds
-
-    # Kontrollera dimensioner
-    if p.dim() != 3:
-        # Fallback om något är fel, returnera tom lista
-        return [[] for _ in range(len(preds) if isinstance(preds, list) else 1)]
-
-    B, N, D = p.shape
-    
-    # Modellen ger redan [cx, cy, w, h] i pixlar
-    # Vi behöver konvertera till xyxy för filtrering
-    cx = p[..., 0]
-    cy = p[..., 1]
-    w  = p[..., 2]
-    h  = p[..., 3]
-    tcls = p[..., 4:]
-
-    # xywh -> xyxy
-    x1 = cx - 0.5 * w
-    y1 = cy - 0.5 * h
-    x2 = cx + 0.5 * w
-    y2 = cy + 0.5 * h
-    boxes_xyxy = torch.stack([x1, y1, x2, y2], dim=-1)
-
+    B = preds_flat.shape[0]
     out_dets = [[] for _ in range(B)]
 
     for b in range(B):
-        b_boxes = boxes_xyxy[b]      # [N, 4]
-        b_logits = tcls[b]           # [N, C]
+        p = preds_flat[b] # [Total, 4+C]
         
-        # 2. Hitta bästa klass och score
-        scores = b_logits.sigmoid()
-        max_scores, class_ids = scores.max(dim=-1) # [N]
+        boxes_xyxy = p[:, :4]
+        cls_logits = p[:, 4:]
         
-        # 3. Filtrera på confidence (COCO mAP kräver låg tröskel, t.ex. 0.001)
+        # --- NMS-Fri Logik ---
+        # 1. Hitta max score per ankare
+        scores = cls_logits.sigmoid()
+        max_scores, class_ids = scores.max(dim=1) # [Total]
+        
+        # 2. Hård filtrering
         mask = max_scores > conf_th
         if not mask.any():
             continue
             
-        sel_boxes = b_boxes[mask]
+        sel_boxes = boxes_xyxy[mask]
         sel_scores = max_scores[mask]
         sel_classes = class_ids[mask]
         
-        # 4. (Valfritt) Säkerhets-NMS
-        # Även om modellen är NMS-fri, hjälper detta i början av träningen
+        # 3. (Valfritt) Säkerhets-NMS
+        # Om modellen är vältränad med End-to-End loss behövs detta oftast inte,
+        # eller så kan du ha en väldigt hög tröskel (0.8) för att bara ta bort extrema dubbletter.
+        # Vi sätter default till "off" eller mycket hög för äkta End-to-End känsla.
         if iou_th < 1.0:
             keep = nms(sel_boxes, sel_scores, iou_th)
             sel_boxes = sel_boxes[keep]
             sel_scores = sel_scores[keep]
             sel_classes = sel_classes[keep]
             
-        # 5. Formatera för COCO (xyxy -> xywh)
-        # Klipp till bildens storlek
+        # Formatera för COCO
+        # xyxy -> xywh
         sel_boxes[:, 0::2].clamp_(0, img_size)
         sel_boxes[:, 1::2].clamp_(0, img_size)
         
         bxywh = _xyxy_to_xywh(sel_boxes).cpu().tolist()
         sc = sel_scores.cpu().tolist()
-        cc = (sel_classes + (1 if add_one else 0)).cpu().tolist() # COCO 1-based category_id
+        cc = (sel_classes + (1 if add_one else 0)).cpu().tolist() # COCO 1-based
         
         dets = []
         for bx, sc_, cid in zip(bxywh, sc, cc):
@@ -292,6 +209,7 @@ def _coco_eval_from_lists(coco_images, coco_anns, coco_dets, iouType="bbox", num
         E.summarize()
         # sys.stdout = sys.__stdout__
         
+        
         return {
             "AP":   float(E.stats[0]),
             "AP50": float(E.stats[1]),
@@ -324,3 +242,113 @@ def _append_csv(path, header: list, row: list):
             f.write(",".join(header) + "\n")
         f.write(",".join(str(x) for x in row) + "\n")
 
+@torch.no_grad()
+def save_val_debug_anchorfree(imgs, preds, epoch, out_dir,
+                              img_size=416, conf_th=0.25, iou_th=0.45,
+                              mean=(0.485,0.456,0.406), std=(0.229,0.224,0.225),
+                              center_mode="v8", wh_mode="softplus"):
+    """
+    [ÄNDRAD] Debug-funktion för End-to-End modellen.
+    Ritar boxar direkt från klass-score.
+    """
+    os.makedirs(out_dir, exist_ok=True)
+    device = imgs.device
+    
+    # 1. Gör samma decoding som förut
+    # Vi kan återanvända logiken, men här implementerar vi en snabb in-place version för visualisering
+    
+    preds_list = preds if isinstance(preds, (list, tuple)) else [preds]
+    B = preds_list[0].shape[0]
+
+    def _denorm(img_t):
+        img = img_t.detach().float().cpu()
+        for t, m, s in zip(img, mean, std):
+            t.mul_(s).add_(m)
+        np_img = (img.permute(1,2,0).numpy() * 255.0).clip(0,255).astype("uint8")
+        return cv2.cvtColor(np.ascontiguousarray(np_img), cv2.COLOR_RGB2BGR)
+
+    # Decode alla nivåer
+    all_boxes = []
+    all_scores = []
+    all_classes = []
+
+    for p in preds_list:
+        # [B, A, S, S, 4+C]
+        B, A, S, _, D = p.shape
+        stride = img_size / S
+        
+        tx, ty, tw, th = p[..., 0], p[..., 1], p[..., 2], p[..., 3]
+        tcls = p[..., 4:]
+        
+        gy, gx = torch.meshgrid(torch.arange(S, device=device), torch.arange(S, device=device), indexing="ij")
+        
+        if center_mode == "v8":
+            px = ((torch.sigmoid(tx) * 2 - 0.5) + gx) * stride
+            py = ((torch.sigmoid(ty) * 2 - 0.5) + gy) * stride
+        else:
+            px = (torch.sigmoid(tx) + gx) * stride
+            py = (torch.sigmoid(ty) + gy) * stride
+            
+        if wh_mode == "softplus":
+            pw = F.softplus(tw) * stride
+            ph = F.softplus(th) * stride
+        elif wh_mode == "v8":
+            pw = (torch.sigmoid(tw) * 2).pow(2) * stride
+            ph = (torch.sigmoid(th) * 2).pow(2) * stride
+        else:
+            pw = torch.exp(tw.clamp(-10, 8)) * stride
+            ph = torch.exp(th.clamp(-10, 8)) * stride
+            
+        x1 = px - pw * 0.5
+        y1 = py - ph * 0.5
+        x2 = px + pw * 0.5
+        y2 = py + ph * 0.5
+        
+        boxes = torch.stack([x1, y1, x2, y2], dim=-1).view(B, -1, 4)
+        
+        # Max score över klasser
+        scores_prob = torch.sigmoid(tcls)
+        max_sc, max_idx = scores_prob.max(dim=-1)
+        max_sc = max_sc.view(B, -1)
+        max_idx = max_idx.view(B, -1)
+        
+        all_boxes.append(boxes)
+        all_scores.append(max_sc)
+        all_classes.append(max_idx)
+
+    flat_boxes = torch.cat(all_boxes, dim=1)
+    flat_scores = torch.cat(all_scores, dim=1)
+    flat_classes = torch.cat(all_classes, dim=1)
+
+    # Rita per bild
+    for b in range(min(B, 4)): # Max 4 bilder debug
+        img_np = _denorm(imgs[b])
+        
+        fb = flat_boxes[b]
+        fs = flat_scores[b]
+        fc = flat_classes[b]
+        
+        # Threshold
+        mask = fs > conf_th
+        if not mask.any():
+            cv2.imwrite(os.path.join(out_dir, f"epoch_{epoch}_b{b}.jpg"), img_np)
+            continue
+            
+        fb = fb[mask]
+        fs = fs[mask]
+        fc = fc[mask]
+        
+        # Säkerhets-NMS för visualisering (om man vill ha renare bilder)
+        if iou_th < 1.0:
+            keep = nms(fb, fs, iou_th)
+            fb = fb[keep]
+            fs = fs[keep]
+            fc = fc[keep]
+
+        for box, score, cid in zip(fb, fs, fc):
+            x1, y1, x2, y2 = [int(v) for v in box.tolist()]
+            cv2.rectangle(img_np, (x1, y1), (x2, y2), (0, 255, 0), 2)
+            label = f"{int(cid)}: {score:.2f}"
+            cv2.putText(img_np, label, (x1, max(0, y1-5)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+            
+        cv2.imwrite(os.path.join(out_dir, f"epoch_{epoch}_b{b}.jpg"), img_np)
