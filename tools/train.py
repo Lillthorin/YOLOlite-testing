@@ -178,8 +178,7 @@ if __name__ == "__main__":
             width_multiple=config["model"].get("width_multiple", 1.0),
             head_depth=config["model"].get("head_depth", 1),
             use_p6=config["training"]["use_p6"],
-            use_p2 = config["training"]["use_p2"],
-            neck_variant = config["training"]["neck_variant"]
+            use_p2 = config["training"]["use_p2"]
             
         ).to(DEVICE)
 
@@ -322,18 +321,15 @@ if __name__ == "__main__":
             # statistik per batch (utan dubbelberäkning)
             B = imgs.size(0)
             box_show = float(loss_dict['box']) / B
-            obj_show = float(loss_dict['obj']) / B
             cls_show = float(loss_dict['cls']) / B
-            loss_show = box_show + obj_show + cls_show
+            loss_show = box_show + cls_show
 
             running += loss_show
             box_m   += box_show
-            obj_m   += obj_show
             cls_m   += cls_show
 
             train_pbar.set_postfix(loss=f"{running/(i+1):.4f}",
                                 box=f"{box_m/(i+1):.4f}",
-                                obj=f"{obj_m/(i+1):.4f}",
                                 cls=f"{cls_m/(i+1):.4f}")
 
         avg_train = running / max(1, len(train_loader))
@@ -378,14 +374,13 @@ if __name__ == "__main__":
                 B = imgs.size(0)
                 
                 vb += float(vdict['box']) / B
-                vo += float(vdict['obj']) / B
                 vc += float(vdict['cls']) / B
-                v_running = vb + vo + vc
+                v_running = vb + vc
                 if i == t and epoch+1 > 5:
                     save_val_debug_anchorfree(
                         imgs, preds, epoch, out_dir=log_dir,
                         img_size=IMG_SIZE, conf_th=val_thresh, iou_th=0.3,
-                        topk=300, center_mode="v8", wh_mode="softplus"
+                       center_mode="v8", wh_mode="softplus"
                     )
 
                 # Bygg COCO GT/DT
@@ -439,7 +434,6 @@ if __name__ == "__main__":
                         scheduler.step()
                 val_pbar.set_postfix(loss=f"{v_running/(i+1):.4f}",
                                     box=f"{vb/(i+1):.4f}",
-                                    obj=f"{vo/(i+1):.4f}",
                                     cls=f"{vc/(i+1):.4f}")
                 
         # Evaluate every : if epoch % 5 == 0:
