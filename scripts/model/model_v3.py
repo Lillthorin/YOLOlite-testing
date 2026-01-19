@@ -257,6 +257,7 @@ class YOLOLiteMS(nn.Module):
     def get_strides(self):
         return list(self.fpn_strides)
 
+
 class YOLOLiteMS_CPU(nn.Module):
     def __init__(
         self,
