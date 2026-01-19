@@ -13,7 +13,7 @@ ROOT = os.getcwd()
 if str(ROOT) not in sys.path:
     sys.path.append(str(ROOT))
 from torch.utils.data import DataLoader
-from scripts.model.model_v2 import YOLOLiteMS, YOLOLiteMS_CPU
+from scripts.model.model_v3 import YOLOLiteMS, YOLOLiteMS_CPU
 from scripts.data.dataset import YoloDataset
 from scripts.data.augment import get_base_transform, get_val_transform, get_strong_transform
 from scripts.loss.loss import LossAF
@@ -573,6 +573,7 @@ if __name__ == "__main__":
 
     
     
+
 
 
 
