@@ -51,7 +51,117 @@ def _xyxy_to_xywh(xyxy: torch.Tensor) -> torch.Tensor:
     return torch.stack([cx, cy, w, h], dim=-1)
 
 # =============== Decoding & Evaluering ===============
+@torch.no_grad()
+def save_val_debug_anchorfree(imgs, preds, epoch, out_dir,
+                              img_size=640, conf_th=0.25, iou_th=0.45,
+                              mean=(0.485,0.456,0.406), std=(0.229,0.224,0.225),
+                              center_mode="v8", wh_mode="softplus"):
+    """
+    [FIXAD] Debug-funktion för End-to-End modellen.
+    Hanterar platt output [Batch, TotalAnchors, 4+C] där koordinaterna redan är pixlar.
+    """
+    import os, cv2, torch, numpy as np
+    from torchvision.ops import nms
 
+    os.makedirs(out_dir, exist_ok=True)
+    device = imgs.device
+    
+    # 1. Hantera input-format
+    # Modellen returnerar [B, N, 4+C] vid validering.
+    # Om det är en lista (från träning ibland), ta första elementet (Main output).
+    if isinstance(preds, (list, tuple)):
+        p = preds[0]
+    else:
+        p = preds
+
+    # Kontrollera att vi har rätt form: [B, N, D]
+    if p.dim() != 3:
+        print(f"Varning: save_val_debug fick fel dimensioner {p.shape}, hoppar över.")
+        return
+
+    B, N, D = p.shape
+    
+    # Eftersom modellen redan avkodar till pixlar (xywh), behöver vi bara konvertera till xyxy
+    # p[..., :4] är [cx, cy, w, h] i pixlar
+    cx = p[..., 0]
+    cy = p[..., 1]
+    w  = p[..., 2]
+    h  = p[..., 3]
+    tcls = p[..., 4:]
+
+    # xywh -> xyxy
+    x1 = cx - 0.5 * w
+    y1 = cy - 0.5 * h
+    x2 = cx + 0.5 * w
+    y2 = cy + 0.5 * h
+    
+    # [B, N, 4]
+    boxes_xyxy = torch.stack([x1, y1, x2, y2], dim=-1)
+
+    # Helper för att denormalisera bild
+    def _denorm(img_t):
+        img = img_t.detach().float().cpu()
+        for t, m, s in zip(img, mean, std):
+            t.mul_(s).add_(m)
+        np_img = (img.permute(1,2,0).numpy() * 255.0).clip(0,255).astype("uint8")
+        return cv2.cvtColor(np.ascontiguousarray(np_img), cv2.COLOR_RGB2BGR)
+
+    # 2. Loopa över batch och rita
+    for b in range(min(B, 4)): # Spara max 4 bilder
+        img_np = _denorm(imgs[b])
+        
+        # Hämta data för denna bild
+        b_boxes = boxes_xyxy[b]      # [N, 4]
+        b_logits = tcls[b]           # [N, C]
+        
+        # Hitta bästa klass och score
+        scores = b_logits.sigmoid()
+        max_scores, class_ids = scores.max(dim=-1) # [N]
+        
+        # Filtrera på confidence (viktigt för att slippa rita 8400 boxar)
+        mask = max_scores > conf_th
+        
+        if not mask.any():
+            # Inga objekt hittades, spara tom bild
+            cv2.imwrite(os.path.join(out_dir, f"epoch_{epoch}_b{b}_empty.jpg"), img_np)
+            continue
+            
+        sel_boxes = b_boxes[mask]
+        sel_scores = max_scores[mask]
+        sel_classes = class_ids[mask]
+        
+        # (Valfritt) Säkerhets-NMS för renare visualisering
+        # Även om modellen är NMS-fri kan den ge dubbletter i början av träningen
+        if iou_th < 1.0:
+            keep = nms(sel_boxes, sel_scores, iou_th)
+            sel_boxes = sel_boxes[keep]
+            sel_scores = sel_scores[keep]
+            sel_classes = sel_classes[keep]
+        
+        # Begränsa antalet ritade boxar så bilden inte blir klottrig
+        if sel_scores.numel() > 50:
+            topk = sel_scores.topk(50).indices
+            sel_boxes = sel_boxes[topk]
+            sel_scores = sel_scores[topk]
+            sel_classes = sel_classes[topk]
+
+        # Rita
+        for box, score, cid in zip(sel_boxes, sel_scores, sel_classes):
+            _x1, _y1, _x2, _y2 = [int(v) for v in box.tolist()]
+            
+            # Clip innanför bild
+            _x1 = max(0, min(img_size, _x1))
+            _y1 = max(0, min(img_size, _y1))
+            _x2 = max(0, min(img_size, _x2))
+            _y2 = max(0, min(img_size, _y2))
+
+            label = f"{int(cid)}: {score:.2f}"
+            color = (0, 255, 0) # Grön
+            
+            cv2.rectangle(img_np, (_x1, _y1), (_x2, _y2), color, 2)
+            cv2.putText(img_np, label, (_x1, max(10, _y1-5)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
+            
+        cv2.imwrite(os.path.join(out_dir, f"epoch_{epoch}_b{b}.jpg"), img_np)
 @torch.no_grad()
 def _decode_batch_to_coco_dets(preds, img_size, conf_th=0.001, iou_th=0.65, add_one=True, center_mode="v8", wh_mode="softplus"):
     """
@@ -213,3 +323,4 @@ def _append_csv(path, header: list, row: list):
         if make_header:
             f.write(",".join(header) + "\n")
         f.write(",".join(str(x) for x in row) + "\n")
+
