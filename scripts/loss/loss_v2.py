@@ -1,283 +1,343 @@
+import math
+from typing import List
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-# ----------------- Helper Functions -----------------
+# --------------------------- Hjälp-funktioner ---------------------------
 
-def xywh_to_xyxy(xywh: torch.Tensor) -> torch.Tensor:
-    """Konverterar center-xywh till xyxy."""
-    cx, cy, w, h = xywh.unbind(-1)
-    x1 = cx - 0.5 * w
-    y1 = cy - 0.5 * h
-    x2 = cx + 0.5 * w
-    y2 = cy + 0.5 * h
-    return torch.stack([x1, y1, x2, y2], dim=-1)
-
-def bbox_iou(box1, box2, eps=1e-7):
-    """
-    Beräknar IoU mellan box1 (N, 4) och box2 (M, 4).
-    Returnerar (N, M) matris.
-    """
-    # box: x1, y1, x2, y2
-    b1_x1, b1_y1, b1_x2, b1_y2 = box1.unbind(-1)
-    b2_x1, b2_y1, b2_x2, b2_y2 = box2.unbind(-1)
-
-    # Area
-    area1 = (b1_x2 - b1_x1).clamp(min=0) * (b1_y2 - b1_y1).clamp(min=0)
-    area2 = (b2_x2 - b2_x1).clamp(min=0) * (b2_y2 - b2_y1).clamp(min=0)
-
-    # Intersection
-    inter_x1 = torch.max(b1_x1[:, None], b2_x1[None, :])
-    inter_y1 = torch.max(b1_y1[:, None], b2_y1[None, :])
-    inter_x2 = torch.min(b1_x2[:, None], b2_x2[None, :])
-    inter_y2 = torch.min(b1_y2[:, None], b2_y2[None, :])
-
-    inter_w = (inter_x2 - inter_x1).clamp(min=0)
-    inter_h = (inter_y2 - inter_y1).clamp(min=0)
-    inter_area = inter_w * inter_h
-
-    union = area1[:, None] + area2[None, :] - inter_area + eps
-    return inter_area / union
-
-def bbox_ciou(pred_xyxy, target_xyxy, eps=1e-7):
-    """
-    CIoU Loss mellan matchade par.
-    pred_xyxy: [N, 4], target_xyxy: [N, 4]
-    """
-    px1, py1, px2, py2 = pred_xyxy.unbind(-1)
-    tx1, ty1, tx2, ty2 = target_xyxy.unbind(-1)
-
-    # Intersection
-    inter_x1 = torch.max(px1, tx1); inter_y1 = torch.max(py1, ty1)
-    inter_x2 = torch.min(px2, tx2); inter_y2 = torch.min(py2, ty2)
-    inter_w = (inter_x2 - inter_x1).clamp(min=0)
-    inter_h = (inter_y2 - inter_y1).clamp(min=0)
-    inter_area = inter_w * inter_h
-
-    # Union
-    w1, h1 = px2 - px1, py2 - py1
-    w2, h2 = tx2 - tx1, ty2 - ty1
-    union = w1*h1 + w2*h2 - inter_area + eps
-    iou = inter_area / union
-
-    # Enclosing box
-    cw = torch.max(px2, tx2) - torch.min(px1, tx1)
-    ch = torch.max(py2, ty2) - torch.min(py1, ty1)
-    c2 = cw.pow(2) + ch.pow(2) + eps
-
-    # Center distance
-    rho2 = ((px1+px2 - tx1-tx2)**2 + (py1+py2 - ty1-ty2)**2) / 4
-
-    # Aspect ratio
-    v = (4 / (3.14159 ** 2)) * torch.pow(torch.atan(w2 / (h2 + eps)) - torch.atan(w1 / (h1 + eps)), 2)
-    with torch.no_grad():
-        alpha = v / (1 - iou + v + eps)
-
-    ciou = iou - (rho2 / c2) - alpha * v
-    return ciou.clamp(min=-1.0, max=1.0)
-
-def _targets_to_xyxy_px(tgt: dict, img_size: int, device: torch.device):
-    """Extraherar targets och säkerställer pixel-koordinater."""
+def _targets_to_xyxy_px(tgt: dict, W: int, H: int, device: torch.device):
     boxes = None
     for k in ("boxes", "bboxes", "xyxy"):
         if k in tgt and tgt[k] is not None:
             boxes = tgt[k]
             break
-    
     if boxes is None:
         return torch.zeros((0, 4), dtype=torch.float32, device=device)
 
-    b = torch.as_tensor(boxes, dtype=torch.float32, device=device)
+    if isinstance(boxes, torch.Tensor):
+        b = boxes.detach().to(device=device, dtype=torch.float32)
+    else:
+        b = torch.as_tensor(boxes, dtype=torch.float32, device=device)
+
     if b.numel() == 0:
         return b.view(0, 4)
 
-    # Antag att targets är 0..1 (xywhn eller xyxyn)
-    # Om max-värdet <= 1.01 antar vi normaliserat och skalar upp
-    if b.max() <= 1.01:
-        b = b * img_size
+    b_min = float(b.min().item())
+    b_max = float(b.max().item())
 
-    # Heuristik: Om bredd/höjd är små jämfört med x/y är det nog xyxy
-    # Men låt oss anta XYXY för enkelhetens skull eller konvertera om det är XYWH
-    # Här gör vi en säker konvertering om det verkar vara xywh
-    # (x_center < width är omöjligt för xywh om objektet är i mitten, men...)
-    # Vi antar att din dataloader ger [x1, y1, x2, y2] i pixlar. 
-    # Om din dataloader ger xywh, aktivera raden nedan:
-    # b = xywh_to_xyxy(b) 
-    
-    return b
+    def xywh_px_to_xyxy_px(bt: torch.Tensor) -> torch.Tensor:
+        x1 = bt[:, 0] - bt[:, 2] * 0.5
+        y1 = bt[:, 1] - bt[:, 3] * 0.5
+        x2 = bt[:, 0] + bt[:, 2] * 0.5
+        y2 = bt[:, 1] + bt[:, 3] * 0.5
+        return torch.stack([x1, y1, x2, y2], dim=1)
 
-# ----------------- Hybrid Loss Class -----------------
+    # normalized (0..1)
+    if -1e-3 <= b_min <= 1.01 and -1e-3 <= b_max <= 1.01:
+        mean_wh = float((b[:, 2] + b[:, 3]).mean().item())
+        if mean_wh <= 2.01:  # xywhn
+            cx = b[:, 0] * W
+            cy = b[:, 1] * H
+            ww = b[:, 2] * W
+            hh = b[:, 3] * H
+            return xywh_px_to_xyxy_px(torch.stack([cx, cy, ww, hh], dim=1))
+        else:  # xyxyn
+            x1 = b[:, 0] * W
+            y1 = b[:, 1] * H
+            x2 = b[:, 2] * W
+            y2 = b[:, 3] * H
+            return torch.stack([x1, y1, x2, y2], dim=1)
 
-class LossHybrid(nn.Module):
-    def __init__(self, 
-                 num_classes, 
-                 img_size, 
-                 lambda_box=7.5, 
-                 lambda_cls=0.5, 
-                 lambda_aux=0.25, # Hur mycket Aux påverkar (0.25 är standard)
-                 topk_o2o=1,      # Main Branch: Endast bästa matchningen (NMS-fri)
-                 topk_o2m=10):    # Aux Branch: De 10 bästa (Ger snabb inlärning)
+    likely_xyxy = ((b[:, 2] > b[:, 0]) & (b[:, 3] > b[:, 1])).float().mean().item() > 0.8
+    return b if likely_xyxy else xywh_px_to_xyxy_px(b)
+
+
+def xywh_to_xyxy(xywh: torch.Tensor) -> torch.Tensor:
+    cx, cy, w, h = xywh.unbind(-1)
+    x1 = cx - w * 0.5
+    y1 = cy - h * 0.5
+    x2 = cx + w * 0.5
+    y2 = cy + h * 0.5
+    return torch.stack([x1, y1, x2, y2], dim=-1)
+
+
+def bbox_ciou(pred_xyxy: torch.Tensor, target_xyxy: torch.Tensor, eps: float = 1e-7) -> torch.Tensor:
+    px1, py1, px2, py2 = pred_xyxy.unbind(-1)
+    tx1, ty1, tx2, ty2 = target_xyxy.unbind(-1)
+
+    pw = (px2 - px1).clamp(min=eps)
+    ph = (py2 - py1).clamp(min=eps)
+    tw = (tx2 - tx1).clamp(min=eps)
+    th = (ty2 - ty1).clamp(min=eps)
+
+    inter_w = (torch.min(px2, tx2) - torch.max(px1, tx1)).clamp(min=0)
+    inter_h = (torch.min(py2, ty2) - torch.max(py1, ty1)).clamp(min=0)
+    inter = inter_w * inter_h
+    union = pw * ph + tw * th - inter + eps
+    iou = inter / union
+
+    pcx = (px1 + px2) * 0.5
+    pcy = (py1 + py2) * 0.5
+    tcx = (tx1 + tx2) * 0.5
+    tcy = (ty1 + ty2) * 0.5
+    center_dist = (pcx - tcx) ** 2 + (pcy - tcy) ** 2
+
+    cw = torch.max(px2, tx2) - torch.min(px1, tx1)
+    ch = torch.max(py2, ty2) - torch.min(py1, ty1)
+    c2 = cw ** 2 + ch ** 2 + eps
+
+    v = (4.0 / (math.pi ** 2)) * torch.pow(torch.atan(tw / th) - torch.atan(pw / ph), 2)
+    with torch.no_grad():
+        alpha = v / (v - iou + 1 + eps)
+
+    return iou - (center_dist / c2) - alpha * v
+
+
+def bbox_iou(box1: torch.Tensor, box2: torch.Tensor, eps: float = 1e-7) -> torch.Tensor:
+    area1 = (box1[:, 2] - box1[:, 0]).clamp(min=0) * (box1[:, 3] - box1[:, 1]).clamp(min=0)
+    area2 = (box2[:, 2] - box2[:, 0]).clamp(min=0) * (box2[:, 3] - box2[:, 1]).clamp(min=0)
+
+    inter_x1 = torch.max(box1[:, None, 0], box2[:, 0])
+    inter_y1 = torch.max(box1[:, None, 1], box2[:, 1])
+    inter_x2 = torch.min(box1[:, None, 2], box2[:, 2])
+    inter_y2 = torch.min(box1[:, None, 3], box2[:, 3])
+
+    inter_w = (inter_x2 - inter_x1).clamp(min=0)
+    inter_h = (inter_y2 - inter_y1).clamp(min=0)
+    inter = inter_w * inter_h
+    union = area1[:, None] + area2 - inter + eps
+    return (inter / union).clamp(min=0.0, max=1.0)
+
+
+@torch.no_grad()
+def one_to_one_greedy(cost: torch.Tensor):
+    """
+    Riktig one-to-one (snabb greedy).
+    cost: [Cand, Ngt]
+    return: (cand_local_idx[K], gt_idx[K])
+    """
+    Cand, Ngt = cost.shape
+    assigned = torch.full((Ngt,), -1, device=cost.device, dtype=torch.long)
+    used = torch.zeros((Cand,), device=cost.device, dtype=torch.bool)
+
+    flat = cost.view(-1)
+    order = torch.argsort(flat)  # låg kost först
+
+    for idx in order:
+        c = idx // Ngt
+        g = idx % Ngt
+        if assigned[g] != -1 or used[c]:
+            continue
+        assigned[g] = c
+        used[c] = True
+        if (assigned != -1).all():
+            break
+
+    valid_g = torch.nonzero(assigned != -1).squeeze(1)
+    if valid_g.numel() == 0:
+        return (
+            torch.empty((0,), device=cost.device, dtype=torch.long),
+            torch.empty((0,), device=cost.device, dtype=torch.long),
+        )
+    cand_local = assigned[valid_g]
+    return cand_local, valid_g
+
+
+def focal_loss_map(logits: torch.Tensor, targets: torch.Tensor, gamma: float, alpha: float):
+    """Return [N, C] focal loss map (no reduction)."""
+    probs = torch.sigmoid(logits)
+    ce = F.binary_cross_entropy_with_logits(logits, targets, reduction="none")
+    p_t = probs * targets + (1.0 - probs) * (1.0 - targets)
+    loss = ce * ((1.0 - p_t) ** gamma)
+
+    if alpha is not None and alpha >= 0:
+        alpha_t = alpha * targets + (1.0 - alpha) * (1.0 - targets)
+        loss = alpha_t * loss
+    return loss
+
+
+# --------------------------- LossAF (snabb + bättre) ---------------------------
+
+class LossAF(nn.Module):
+    def __init__(
+        self,
+        num_classes: int,
+        img_size: int,
+        lambda_box: float = 7.5,
+        lambda_cls: float = 0.5,
+        center_mode: str = "v8",
+        wh_mode: str = "softplus",
+        # Matching
+        topk_candidates: int = 10,
+        alpha_cost: float = 1.5,
+        beta_cost: float = 6.0,
+        use_log_cost: bool = True,
+        # Focal
+        gamma: float = 2.0,
+        alpha: float = 0.25,
+        # Optional per-class weights
+        class_weights=None,  # e.g. [1.0, 2.0, 6.0] or None
+    ):
         super().__init__()
-        self.num_classes = num_classes
-        self.img_size = img_size
-        self.lambda_box = lambda_box
-        self.lambda_cls = lambda_cls
-        self.lambda_aux = lambda_aux
-        self.topk_o2o = topk_o2o
-        self.topk_o2m = topk_o2m
+        self.num_classes = int(num_classes)
+        self.img_size = int(img_size)
+        self.lambda_box = float(lambda_box)
+        self.lambda_cls = float(lambda_cls)
+        self.center_mode = center_mode
+        self.wh_mode = wh_mode
+        self.topk_candidates = int(topk_candidates)
+        self.alpha_cost = float(alpha_cost)
+        self.beta_cost = float(beta_cost)
+        self.use_log_cost = bool(use_log_cost)
+        self.gamma = float(gamma)
+        self.alpha = float(alpha)
 
-    def get_assignments(self, p_box, p_logits, gt_box, gt_lbl, k_match):
+        if class_weights is not None:
+            cw = torch.as_tensor(class_weights, dtype=torch.float32).view(1, -1)
+            if cw.numel() != self.num_classes:
+                raise ValueError(f"class_weights must have length {self.num_classes}, got {cw.numel()}")
+            self.register_buffer("class_weights", cw)
+        else:
+            self.class_weights = None
+
+    def _decode(self, p, stride):
+        device = p.device
+        B, A, S, _, E = p.shape
+        tx, ty, tw, th = p[..., 0], p[..., 1], p[..., 2], p[..., 3]
+        tcls_logits = p[..., 4:]
+
+        gy, gx = torch.meshgrid(
+            torch.arange(S, device=device),
+            torch.arange(S, device=device),
+            indexing="ij",
+        )
+        gx = gx.view(1, 1, S, S)
+        gy = gy.view(1, 1, S, S)
+
+        if self.center_mode == "v8":
+            px = ((torch.sigmoid(tx) * 2.0 - 0.5) + gx) * stride
+            py = ((torch.sigmoid(ty) * 2.0 - 0.5) + gy) * stride
+        else:
+            px = (torch.sigmoid(tx) + gx) * stride
+            py = (torch.sigmoid(ty) + gy) * stride
+
+        if self.wh_mode == "softplus":
+            pw = F.softplus(tw) * stride
+            ph = F.softplus(th) * stride
+        elif self.wh_mode == "v8":
+            pw = (torch.sigmoid(tw) * 2).pow(2) * stride
+            ph = (torch.sigmoid(th) * 2).pow(2) * stride
+        else:
+            pw = torch.exp(tw.clamp(-10, 8)) * stride
+            ph = torch.exp(th.clamp(-10, 8)) * stride
+
+        pred_box = torch.stack([px, py, pw, ph], dim=-1).view(B, -1, 4)
+        pred_cls = tcls_logits.view(B, -1, self.num_classes)
+        return pred_box, pred_cls
+
+    def _get_cost(self, pred_logits: torch.Tensor, pred_box_xywh: torch.Tensor, gt_box_xyxy: torch.Tensor, gt_labels: torch.Tensor):
         """
-        SimOTA-liknande / Dynamic Soft Label Assign
-        k_match avgör om det är One-to-One eller One-to-Many.
+        cost: [Cand, Ngt]
         """
-        N = gt_box.shape[0]
-        Total = p_box.shape[0]
-        
-        if N == 0:
-            return None, None
+        sel_logits = pred_logits[:, gt_labels]  # [Cand, Ngt]
 
-        # 1. Grovfiltrering: Hitta ankare vars center är någorlunda nära GT
-        # Detta sparar minne jämfört med att räkna på alla 8400 ankare
-        gt_cx = (gt_box[:,0] + gt_box[:,2]) / 2
-        gt_cy = (gt_box[:,1] + gt_box[:,3]) / 2
-        p_cx = (p_box[:,0] + p_box[:,2]) / 2
-        p_cy = (p_box[:,1] + p_box[:,3]) / 2
+        if self.use_log_cost:
+            p = torch.sigmoid(sel_logits).clamp(1e-6, 1.0 - 1e-6)
+            cost_cls = -torch.log(p)  # starkare signal när p är låg
+        else:
+            cost_cls = 1.0 - torch.sigmoid(sel_logits)
 
-        # Avstånd [Total, N]
-        dist = (p_cx.unsqueeze(1) - gt_cx.unsqueeze(0)).pow(2) + \
-               (p_cy.unsqueeze(1) - gt_cy.unsqueeze(0)).pow(2)
-        
-        # Välj top-k närmaste (geometriskt) kandidater att räkna exakt cost på
-        # Vi tar 50 kandidater per GT för att vara säkra
-        n_cand = min(50, Total)
-        _, cand_idx = dist.topk(n_cand, dim=0, largest=False)
-        cand_idx = cand_idx.flatten().unique()
-        
-        c_box = p_box[cand_idx]        # [Cand, 4]
-        c_logits = p_logits[cand_idx]  # [Cand, C]
+        iou = bbox_iou(xywh_to_xyxy(pred_box_xywh), gt_box_xyxy)  # [Cand, Ngt]
+        cost_box = 1.0 - iou
 
-        # 2. Beräkna Cost Matrix
-        # Cost = L_cls + L_iou
-        
-        # Cls Cost
-        pred_prob = c_logits.sigmoid()
-        # Hämta sannolikhet för "rätt" klass
-        target_prob = pred_prob[:, gt_lbl] # [Cand, N]
-        cost_cls = F.binary_cross_entropy_with_logits(c_logits[:, gt_lbl], torch.ones_like(target_prob), reduction='none')
-        
-        # IoU Cost
-        iou = bbox_iou(c_box, gt_box) # [Cand, N]
-        cost_box = 6.0 * (1.0 - iou)  # 6.0 är en standardvikt för box-cost
-        
-        total_cost = cost_cls + cost_box + 1e-6
+        return (self.alpha_cost * cost_cls) + (self.beta_cost * cost_box)
 
-        # 3. Matchning (One-to-One eller One-to-Many)
-        matches = torch.zeros_like(total_cost, dtype=torch.bool)
-        
-        # För varje GT, välj de k bästa ankarna
-        # Om k_match=1 blir det strikt One-to-One (NMS-fritt)
-        values, best_idx = total_cost.topk(k_match, dim=0, largest=False) # [k, N]
-        matches.scatter_(0, best_idx, True)
-        
-        # Hantera One-to-One krockar: Ett ankare får inte tillhöra två GTs
-        if k_match == 1:
-            # Om ett ankare valt flera GTs, behåll den med lägst cost
-            if matches.sum(1).max() > 1:
-                vals, gt_ind = total_cost.min(1)
-                matches[:] = False
-                matches[torch.arange(len(cand_idx)), gt_ind] = True # Enkelt val: minsta cost vinner
+    def forward(self, preds: List[torch.Tensor], targets: List[dict]):
+        device = preds[0].device
+        B = preds[0].shape[0]
 
-        # Mappa tillbaka till globala index
-        valid_mask = matches.any(dim=1)
-        matched_anchor_indices = cand_idx[valid_mask]
-        
-        # Hitta vilken GT som varje matchat ankare tillhör
-        # argmax på bool-matrisen ger indexet där det är True
-        assigned_gt_idx = total_cost[valid_mask].argmin(dim=1)
-        
-        return matched_anchor_indices, assigned_gt_idx
+        # Flatten all levels (snabbt)
+        all_pred_boxes, all_pred_logits = [], []
+        for p in preds:
+            S = p.shape[2]
+            stride = self.img_size / S
+            pb, pl = self._decode(p, stride)
+            all_pred_boxes.append(pb)
+            all_pred_logits.append(pl)
 
-    def compute_branch_loss(self, p_flat, targets, k_match):
-        """Räknar ut loss för en gren (Main eller Aux)."""
-        device = p_flat.device
-        B = p_flat.shape[0]
-        
-        loss_box = torch.tensor(0., device=device)
-        loss_cls = torch.tensor(0., device=device)
+        flat_boxes = torch.cat(all_pred_boxes, dim=1)   # [B, Total, 4]
+        flat_logits = torch.cat(all_pred_logits, dim=1) # [B, Total, C]
+        Total = flat_logits.shape[1]
+
+        loss_box = torch.zeros((), device=device)
+        loss_cls = torch.zeros((), device=device)
         total_pos = 0
 
-        # Input p_flat är [B, Total, 4+C] och är REDAN DECODAD till pixlar (xywh + logits)
-        p_xywh = p_flat[..., :4]
-        p_xyxy = xywh_to_xyxy(p_xywh)
-        p_logits = p_flat[..., 4:]
-
         for b in range(B):
-            # Hämta targets
-            tgt_xyxy = _targets_to_xyxy_px(targets[b], self.img_size, device)
-            lbl = targets[b]["labels"].long()
-            N = tgt_xyxy.shape[0]
+            tgt_xyxy = _targets_to_xyxy_px(targets[b], self.img_size, self.img_size, device)
+            tgt_labels = targets[b].get("labels", torch.zeros((0,), dtype=torch.long)).to(device).long()
+            N = int(tgt_xyxy.shape[0])
 
-            # Cls Targets (börjar som 0 = bakgrund)
-            tcls = torch.zeros_like(p_logits[b])
+            p_box = flat_boxes[b]     # [Total, 4]
+            p_logits = flat_logits[b] # [Total, C]
+
+            cls_targets = torch.zeros_like(p_logits)
 
             if N > 0:
-                # Gör assignments (vem matchar vad?)
-                a_idx, gt_idx = self.get_assignments(p_xyxy[b], p_logits[b], tgt_xyxy, lbl, k_match)
+                p_xyxy = xywh_to_xyxy(p_box)
 
-                if a_idx is not None and len(a_idx) > 0:
-                    # Positives
-                    pos_box = p_xyxy[b][a_idx]
-                    pos_gt = tgt_xyxy[gt_idx]
+                # candidate prefilter (snabb)
+                tgt_cx = (tgt_xyxy[:, 0] + tgt_xyxy[:, 2]) * 0.5
+                tgt_cy = (tgt_xyxy[:, 1] + tgt_xyxy[:, 3]) * 0.5
+                p_cx = p_box[:, 0]
+                p_cy = p_box[:, 1]
 
-                    # 1. Box Loss (CIoU)
-                    ciou = bbox_ciou(pos_box, pos_gt)
-                    loss_box += (1.0 - ciou).sum()
+                dist = (p_cx[:, None] - tgt_cx[None, :]).pow(2) + (p_cy[:, None] - tgt_cy[None, :]).pow(2)
 
-                    # 2. Cls Targets
-                    # Sätt target=1 för rätt klass på matchade ankare
-                    tcls[a_idx, lbl[gt_idx]] = 1.0
-                    
-                    total_pos += len(a_idx)
+                k = min(self.topk_candidates, Total)
+                _, candidate_idx = torch.topk(dist, k, dim=0, largest=False)  # [k, N]
+                candidate_idx = candidate_idx.flatten().unique()
 
-            # 3. Cls Loss (BCE / Focal) på ALLA ankare (Positive + Negative)
-            # Detta trycker ner bakgrunden mot 0 och positiverna mot 1
-            loss_cls += F.binary_cross_entropy_with_logits(p_logits[b], tcls, reduction='sum')
+                cand_logits = p_logits[candidate_idx]
+                cand_box = p_box[candidate_idx]
 
-        # Normalisera lossen med antal positiver (för att inte batch-storlek ska påverka)
-        norm = max(1.0, float(total_pos))
-        
-        return (loss_box * self.lambda_box / norm), (loss_cls * self.lambda_cls / norm)
+                cost = self._get_cost(cand_logits, cand_box, tgt_xyxy, tgt_labels)  # [Cand, N]
+                cand_local, valid_g = one_to_one_greedy(cost)
 
-    def forward(self, preds, targets):
-        # preds är antingen en tensor (val) eller tuple (train)
-        if isinstance(preds, tuple):
-            p_main, p_aux = preds
-        else:
-            p_main = preds
-            p_aux = None
+                if valid_g.numel() > 0:
+                    matched = candidate_idx[cand_local]
+                    gt_xyxy_m = tgt_xyxy[valid_g]
+                    gt_lbl_m = tgt_labels[valid_g]
 
-        # --- Main Branch (Inference-grenen) ---
-        # Tränas med One-to-One (k=1) för att slippa NMS
-        l_box_m, l_cls_m = self.compute_branch_loss(p_main, targets, k_match=self.topk_o2o)
-        
-        loss = l_box_m + l_cls_m
-        loss_items = {
-            "box": l_box_m.item(), 
-            "cls": l_cls_m.item(), 
-            "aux_box": 0.0, 
-            "aux_cls": 0.0
+                    ciou = bbox_ciou(p_xyxy[matched], gt_xyxy_m)
+                    loss_box = loss_box + (1.0 - ciou).sum()
+                    total_pos += int(valid_g.numel())
+
+                    cls_targets[matched, gt_lbl_m] = 1.0
+
+            # focal cls (snabb, helt vektoriserad)
+            loss_map = focal_loss_map(p_logits, cls_targets, gamma=self.gamma, alpha=self.alpha)
+
+            # per-class weighting (valfritt, device-safe)
+            if self.class_weights is not None:
+                cw = self.class_weights
+                if cw.device != loss_map.device:
+                    cw = cw.to(loss_map.device)
+                loss_map = loss_map * cw
+
+            loss_cls = loss_cls + loss_map.sum()
+
+        # Stabil normalisering (bättre gradients än /N per bild)
+        norm_pos = max(1.0, float(total_pos))
+        norm_cls = norm_pos if total_pos > 0 else float(B * Total)
+
+        loss_box = self.lambda_box * loss_box / norm_pos
+        loss_cls = self.lambda_cls * loss_cls / norm_cls
+
+        total_loss = loss_box + loss_cls
+        return total_loss, {
+            "box": float(loss_box.detach().item()),
+            "cls": float(loss_cls.detach().item()),
+            "pos": float(total_pos) / max(1.0, float(B)),
         }
-
-        # --- Aux Branch (Training-grenen) ---
-        # Tränas med One-to-Many (k=10) för att ge bra gradientsignal
-        if p_aux is not None:
-            l_box_a, l_cls_a = self.compute_branch_loss(p_aux, targets, k_match=self.topk_o2m)
-            
-            # Lägg till Aux loss med en vikt (0.25)
-            loss += self.lambda_aux * (l_box_a + l_cls_a)
-            
-            loss_items["aux_box"] = l_box_a.item()
-            loss_items["aux_cls"] = l_cls_a.item()
-
-        return loss, loss_items
